@@ -27,19 +27,23 @@ type Server struct {
 	IPHeaders  []string
 	LookupAddr func(net.IP) (string, error)
 	LookupPort func(net.IP, uint64) error
+	cache      *Cache
 	gr         geo.Reader
 }
 
 type Response struct {
-	IP         net.IP   `json:"ip"`
-	IPDecimal  *big.Int `json:"ip_decimal"`
-	Country    string   `json:"country,omitempty"`
-	CountryEU  *bool    `json:"country_eu,omitempty"`
-	CountryISO string   `json:"country_iso,omitempty"`
-	City       string   `json:"city,omitempty"`
-	Hostname   string   `json:"hostname,omitempty"`
-	Latitude   float64  `json:"latitude,omitempty"`
-	Longitude  float64  `json:"longitude,omitempty"`
+	IP         net.IP               `json:"ip"`
+	IPDecimal  *big.Int             `json:"ip_decimal"`
+	Country    string               `json:"country,omitempty"`
+	CountryEU  *bool                `json:"country_eu,omitempty"`
+	CountryISO string               `json:"country_iso,omitempty"`
+	City       string               `json:"city,omitempty"`
+	Hostname   string               `json:"hostname,omitempty"`
+	Latitude   float64              `json:"latitude,omitempty"`
+	Longitude  float64              `json:"longitude,omitempty"`
+	ASN        string               `json:"asn,omitempty"`
+	ASNOrg     string               `json:"asn_org,omitempty"`
+	UserAgent  *useragent.UserAgent `json:"user_agent,omitempty"`
 }
 
 type PortResponse struct {
@@ -48,8 +52,8 @@ type PortResponse struct {
 	Reachable bool   `json:"reachable"`
 }
 
-func New(db geo.Reader) *Server {
-	return &Server{gr: db}
+func New(db geo.Reader, cache *Cache) *Server {
+	return &Server{cache: cache, gr: db}
 }
 
 func ipFromForwardedForHeader(v string) string {
@@ -90,14 +94,29 @@ func (s *Server) newResponse(r *http.Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
+	response, ok := s.cache.Get(ip)
+	if ok {
+		return *response, nil
+	}
 	ipDecimal := iputil.ToDecimal(ip)
 	country, _ := s.gr.Country(ip)
 	city, _ := s.gr.City(ip)
+	asn, _ := s.gr.ASN(ip)
 	var hostname string
 	if s.LookupAddr != nil {
 		hostname, _ = s.LookupAddr(ip)
 	}
-	return Response{
+	var autonomousSystemNumber string
+	if asn.AutonomousSystemNumber > 0 {
+		autonomousSystemNumber = fmt.Sprintf("AS%d", asn.AutonomousSystemNumber)
+	}
+	var userAgent *useragent.UserAgent
+	userAgentRaw := r.UserAgent()
+	if userAgentRaw != "" {
+		parsed := useragent.Parse(userAgentRaw)
+		userAgent = &parsed
+	}
+	response = &Response{
 		IP:         ip,
 		IPDecimal:  ipDecimal,
 		Country:    country.Name,
@@ -107,14 +126,19 @@ func (s *Server) newResponse(r *http.Request) (Response, error) {
 		Hostname:   hostname,
 		Latitude:   city.Latitude,
 		Longitude:  city.Longitude,
-	}, nil
+		ASN:        autonomousSystemNumber,
+		ASNOrg:     asn.AutonomousSystemOrganization,
+		UserAgent:  userAgent,
+	}
+	s.cache.Set(ip, response)
+	return *response, nil
 }
 
 func (s *Server) newPortResponse(r *http.Request) (PortResponse, error) {
 	lastElement := filepath.Base(r.URL.Path)
 	port, err := strconv.ParseUint(lastElement, 10, 16)
-	if err != nil || port < 1 || port > 65355 {
-		return PortResponse{Port: port}, fmt.Errorf("invalid port: %d", port)
+	if err != nil || port < 1 || port > 65535 {
+		return PortResponse{Port: port}, fmt.Errorf("invalid port: %s", lastElement)
 	}
 	ip, err := ipFromRequest(s.IPHeaders, r)
 	if err != nil {
@@ -173,6 +197,15 @@ func (s *Server) CLICoordinatesHandler(w http.ResponseWriter, r *http.Request) *
 	return nil
 }
 
+func (s *Server) CLIASNHandler(w http.ResponseWriter, r *http.Request) *appError {
+	response, err := s.newResponse(r)
+	if err != nil {
+		return internalServerError(err)
+	}
+	fmt.Fprintf(w, "%s\n", response.ASN)
+	return nil
+}
+
 func (s *Server) JSONHandler(w http.ResponseWriter, r *http.Request) *appError {
 	response, err := s.newResponse(r)
 	if err != nil {
@@ -196,7 +229,7 @@ func (s *Server) HealthHandler(w http.ResponseWriter, r *http.Request) *appError
 func (s *Server) PortHandler(w http.ResponseWriter, r *http.Request) *appError {
 	response, err := s.newPortResponse(r)
 	if err != nil {
-		return badRequest(err).WithMessage(fmt.Sprintf("Invalid port: %d", response.Port)).AsJSON()
+		return badRequest(err).WithMessage(err.Error()).AsJSON()
 	}
 	b, err := json.Marshal(response)
 	if err != nil {
@@ -222,12 +255,20 @@ func (s *Server) DefaultHandler(w http.ResponseWriter, r *http.Request) *appErro
 	}
 	var data = struct {
 		Response
-		Host string
-		JSON string
-		Port bool
+		Host         string
+		BoxLatTop    float64
+		BoxLatBottom float64
+		BoxLonLeft   float64
+		BoxLonRight  float64
+		JSON         string
+		Port         bool
 	}{
 		response,
 		r.Host,
+		response.Latitude + 0.05,
+		response.Latitude - 0.05,
+		response.Longitude - 0.05,
+		response.Longitude + 0.05,
 		string(json),
 		s.LookupPort != nil,
 	}
@@ -248,7 +289,7 @@ func NotFoundHandler(w http.ResponseWriter, r *http.Request) *appError {
 func cliMatcher(r *http.Request) bool {
 	ua := useragent.Parse(r.UserAgent())
 	switch ua.Product {
-	case "curl", "HTTPie", "Wget", "fetch libfetch", "Go", "Go-http-client", "ddclient":
+	case "curl", "HTTPie", "Wget", "fetch libfetch", "Go", "Go-http-client", "ddclient", "Mikrotik":
 		return true
 	}
 	return false
@@ -297,10 +338,13 @@ func (s *Server) Handler() http.Handler {
 		r.Route("GET", "/country-iso", s.CLICountryISOHandler)
 		r.Route("GET", "/city", s.CLICityHandler)
 		r.Route("GET", "/coordinates", s.CLICoordinatesHandler)
+		r.Route("GET", "/asn", s.CLIASNHandler)
 	}
 
 	// Browser
-	r.Route("GET", "/", s.DefaultHandler)
+	if s.Template != "" {
+		r.Route("GET", "/", s.DefaultHandler)
+	}
 
 	// Port testing
 	if s.LookupPort != nil {
